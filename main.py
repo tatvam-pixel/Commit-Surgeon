@@ -4,14 +4,18 @@ AI-powered offline Git commit management tool.
 """
 
 import sys
+from pathlib import Path
+from typing import List, Optional
 from rich.console import Console
 from rich.panel import Panel
 
 from config.settings import get_settings
+from git_engine.analyzer import analyze_repository
+from git_engine.exceptions import GitError, GitExecutableNotFoundError, NotAGitRepositoryError
 from utils.environment import run_environment_check
 
 
-def main() -> int:
+def run_environment_check_cli() -> int:
     """Execute the Commit Surgeon initial CLI and environment check."""
     console = Console()
     settings = get_settings()
@@ -91,6 +95,73 @@ def main() -> int:
         )
 
     return 0
+
+
+def run_analyze(path: Optional[str] = None) -> int:
+    """Execute repository change analysis and display report using Rich."""
+    console = Console()
+    settings = get_settings()
+
+    try:
+        changes = analyze_repository(path=path, settings=settings)
+    except NotAGitRepositoryError:
+        console.print("[bold red]Error:[/bold red] Current directory is not a Git repository.")
+        return 1
+    except GitExecutableNotFoundError:
+        console.print("[bold red]Error:[/bold red] Git executable 'git' not found in PATH.")
+        return 1
+    except GitError as exc:
+        console.print(f"[bold red]Git Error:[/bold red] {exc}")
+        return 1
+
+    repo_name = Path(changes.repository.root_path).name
+    branch_name = changes.repository.current_branch or "DETACHED HEAD / UNBORN"
+
+    console.print()
+    console.print("[bold cyan]COMMIT SURGEON[/bold cyan]")
+    console.print("Git Change Analysis\n")
+    console.print(f"Repository: [bold]{repo_name}[/bold]")
+    console.print(f"Branch: [bold]{branch_name}[/bold]\n")
+
+    console.print("Detected Changes:\n")
+    console.print(f"Modified: {changes.modified_count}")
+    console.print(f"Added: {changes.added_count}")
+    console.print(f"Deleted: {changes.deleted_count}")
+    console.print(f"Renamed: {changes.renamed_count}")
+    console.print(f"Untracked: {changes.untracked_count}\n")
+
+    console.print("Diff Statistics:\n")
+    console.print("Staged:")
+    console.print(f"- Added lines: {changes.staged_added_lines}")
+    console.print(f"- Deleted lines: {changes.staged_deleted_lines}\n")
+    console.print("Unstaged:")
+    console.print(f"- Added lines: {changes.unstaged_added_lines}")
+    console.print(f"- Deleted lines: {changes.unstaged_deleted_lines}\n")
+    console.print("Total:")
+    console.print(f"- Added lines: {changes.total_added_lines}")
+    console.print(f"- Deleted lines: {changes.total_deleted_lines}")
+    console.print(f"- Hunks: {changes.total_hunks}\n")
+
+    if changes.has_conflicts:
+        console.print("[bold yellow]Warning:[/bold yellow] Unresolved merge conflicts detected in working tree.\n")
+
+    if changes.has_truncated_content:
+        console.print(
+            f"[bold yellow]Notice:[/bold yellow] Diff output exceeded maximum size limit "
+            f"({settings.max_diff_size} chars) and was truncated.\n"
+        )
+
+    console.print("[bold green]Analysis completed successfully.[/bold green]\n")
+    return 0
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """Main CLI entry point for Commit Surgeon."""
+    args = argv if argv is not None else sys.argv[1:]
+    if args and args[0].strip().lower() == "analyze":
+        target_path = args[1] if len(args) > 1 else None
+        return run_analyze(path=target_path)
+    return run_environment_check_cli()
 
 
 if __name__ == "__main__":

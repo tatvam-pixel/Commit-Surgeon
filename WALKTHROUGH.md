@@ -33,40 +33,37 @@ Commit Surgeon is an offline-first, AI-assisted Git management tool. Its long-te
 
 ```mermaid
 flowchart TD
-    subgraph Entry ["1. CLI Entry Point"]
+    subgraph Entry["1. CLI Entry Point"]
         Main["main.py"]
     end
 
-    subgraph ConfigLayer ["2. Configuration Layer"]
+    subgraph ConfigLayer["2. Configuration Layer"]
         DotEnv[".env file"] --> Settings["config/settings.py<br/>(Pydantic Settings)"]
     end
 
-    subgraph Diagnostics ["3. Diagnostic Engine"]
+    subgraph Diagnostics["3. Diagnostic Engine"]
         EnvCheck["utils/environment.py<br/>run_environment_check()"]
         CheckPy["check_python()"]
         CheckGit["check_git()"]
         CheckOllama["check_ollama_service()"]
         CheckModel["check_local_model()"]
+
+        EnvCheck --> CheckPy
+        EnvCheck --> CheckGit
+        EnvCheck --> CheckOllama
+        EnvCheck --> CheckModel
     end
 
-    subgraph Host ["4. Host Environment (Offline)"]
-        GitBin["Git CLI & Repository"]
-        OllamaDaemon["Ollama Service<br/>http://localhost:11434"]
-        LocalModel["Local Model<br/>qwen3.5:4b (4B params)"]
-    end
-
-    subgraph Presentation ["5. Terminal UI"]
-        RichUI["Rich Formatter<br/>(Console & Panels)"]
+    subgraph Output["4. Terminal Output"]
+        Rich["Rich CLI Report"]
+        Report["Environment Status"]
     end
 
     Main --> Settings
     Main --> EnvCheck
-    EnvCheck --> CheckPy
-    EnvCheck --> CheckGit --> GitBin
-    EnvCheck --> CheckOllama --> OllamaDaemon
-    EnvCheck --> CheckModel --> LocalModel
-    EnvCheck --> RichUI
-    Main --> RichUI
+    Settings --> EnvCheck
+    EnvCheck --> Rich
+    Rich --> Report
 ```
 
 ---
@@ -259,3 +256,242 @@ In **Step 2**, we will implement the `git_engine` layer:
 - Patch and hunk parsing
 - Working tree status analysis
 - Token/size limit validation against `max_diff_size`
+
+
+---
+
+## Step 2: Git Integration and Change Extraction
+
+> **Note:** Step 2 is read-only. No files are staged, committed, reset, checked out, cleaned, or pushed. Every operation is purely diagnostic.
+
+### Overview
+
+Step 2 implements the `git_engine` package — a complete, non-destructive Git analysis engine that converts a repository's working tree state into structured Python data objects, ready for AI processing in Step 3.
+
+---
+
+### New Modules
+
+```text
+git_engine/
+├── __init__.py         # Package exports (all public symbols)
+├── exceptions.py       # Typed exception hierarchy
+├── models.py           # Pydantic v2 data models
+├── repository.py       # Repository detection and metadata
+├── status.py           # git status --porcelain=v1 -z parsing
+├── diff.py             # Staged, unstaged, and untracked diff extraction
+├── parser.py           # Unified diff hunk parser
+└── analyzer.py         # Coordinator: combines all modules into RepositoryChanges
+
+tests/
+├── conftest.py             # Shared pytest fixtures (isolated temp repos)
+├── test_git_repository.py  # Repository detection tests
+├── test_git_status.py      # Status detection and parsing tests
+├── test_git_diff.py        # Diff extraction tests
+└── test_git_parser.py      # Hunk parser tests
+```
+
+---
+
+### A. Repository Detection — `git_engine/repository.py`
+
+| Function | Description |
+| :--- | :--- |
+| `is_git_repository(path)` | Detects whether a directory belongs to a Git repository |
+| `get_repository_root(path)` | Resolves the absolute repository root using `rev-parse --show-toplevel` |
+| `get_git_version()` | Returns the installed Git version string |
+| `get_current_branch(path)` | Returns the active branch name (or `None` for detached / unborn) |
+| `get_current_commit(path)` | Returns the HEAD SHA-1, or `None` for repositories without commits |
+| `is_detached_head(path)` | Detects detached HEAD state via `symbolic-ref -q HEAD` |
+| `get_repository_info(path)` | Aggregates all metadata into a `RepositoryInfo` Pydantic model |
+
+All calls use `subprocess.run()` with explicit argument lists; `shell=True` is never used. Errors are raised as typed exceptions, not raw tracebacks.
+
+---
+
+### B. Git Status Detection — `git_engine/status.py`
+
+Uses:
+```
+git status --porcelain=v1 -z --untracked-files=all
+```
+
+The null-delimited `-z` format prevents misinterpretation of spaces, unusual characters, and newlines in filenames.
+
+| Detected State | Description |
+| :--- | :--- |
+| Modified (unstaged) | Working tree modification of a tracked file |
+| Modified (staged) | Index modification of a tracked file |
+| Added (staged) | New file staged for commit |
+| Deleted | File removed from working tree or index |
+| Renamed | File moved (staged) — preserves old and new path |
+| Copied | File copied (where reported by Git) |
+| Untracked | File not yet tracked by Git |
+| Conflicted | Unresolved merge conflict (`UU`, `AA`, `AU`, `UA`, `DU`, `UD`, `DD`) |
+
+---
+
+### C. Diff Extraction — `git_engine/diff.py`
+
+| Function | Git Command | Description |
+| :--- | :--- | :--- |
+| `get_unstaged_diff()` | `git diff --no-ext-diff --no-color --no-renames` | Working tree vs index |
+| `get_staged_diff()` | `git diff --cached --no-ext-diff --no-color --no-renames` | Index vs HEAD |
+| `get_combined_tracked_diff()` | `git diff HEAD ...` | All tracked changes vs HEAD |
+| `generate_untracked_diff()` | file read (no git index) | Synthetic diff for untracked text/binary files |
+| `extract_all_diffs()` | — | Orchestrates all of the above respecting `max_diff_size` |
+
+**Size enforcement:** When total diff size exceeds `Settings.max_diff_size` (default 100,000 characters), extraction is halted and `ExtractedDiffs.is_truncated` is set to `True`. The CLI reports the truncation explicitly; no silent data loss occurs.
+
+**Binary files:** Detected by scanning for null bytes in the first 8 KB of each file. Binary entries receive a synthetic `Binary files ... differ` marker without attempting to render binary content.
+
+---
+
+### D. Hunk Parsing — `git_engine/parser.py`
+
+Parses raw unified diff text into structured objects.
+
+**Hunk header format:** `@@ -old_start,old_count +new_start,new_count @@`
+
+Example:
+```
+@@ -10,3 +10,5 @@
+```
+Extracts: `old_start=10, old_count=3, new_start=10, new_count=5`
+
+Each `DiffHunk` records:
+- `hunk_id` — unique identifier
+- `old_start`, `old_count`, `new_start`, `new_count`
+- `header` — original `@@ ... @@` line
+- `content` — complete hunk text including diff prefixes
+- `added_lines`, `deleted_lines` — per-hunk line counts
+
+---
+
+### E. Structured Data Models — `git_engine/models.py`
+
+Built with **Pydantic v2**:
+
+```text
+RepositoryInfo
+  root_path, current_branch, current_commit, git_version, is_detached
+
+DiffHunk
+  hunk_id, old_start, old_count, new_start, new_count
+  header, content, added_lines, deleted_lines
+
+FileChange
+  file_path, old_path, new_path, change_type
+  is_staged, is_unstaged, is_untracked, is_binary
+  added_lines, deleted_lines, hunks: List[DiffHunk]
+
+RepositoryChanges
+  repository: RepositoryInfo
+  changes: List[FileChange]
+  total_files, total_added_lines, total_deleted_lines, total_hunks
+  has_conflicts, has_truncated_content
+```
+
+Staged and unstaged states are **preserved independently** and never merged incorrectly.
+
+---
+
+### F. Exception Hierarchy — `git_engine/exceptions.py`
+
+| Exception | Raised When |
+| :--- | :--- |
+| `GitError` | Base class for all git engine errors |
+| `NotAGitRepositoryError` | Target directory is not a Git repository |
+| `GitExecutableNotFoundError` | `git` binary not in PATH |
+| `InvalidRepositoryPathError` | Specified path does not exist |
+| `GitCommandError` | Git process exits non-zero |
+| `DiffExtractionError` | Diff extraction subprocess fails |
+| `DiffParsingError` | Diff output cannot be parsed |
+| `UnavailableHeadError` | Repository has no commits |
+| `MergeConflictError` | Unresolved conflicts detected |
+| `OversizedDiffError` | Diff exceeds configured size limit |
+
+---
+
+### G. CLI: `analyze` Command
+
+Added to the existing `main.py` without breaking Step 1 behaviour.
+
+**Usage:**
+```bash
+python main.py analyze
+python main.py analyze /path/to/repo
+```
+
+**Example output:**
+```text
+COMMIT SURGEON
+Git Change Analysis
+
+Repository: my-project
+Branch: feature/login
+
+Detected Changes:
+
+Modified: 3
+Added: 1
+Deleted: 0
+Renamed: 0
+Untracked: 1
+
+Diff Statistics:
+
+Added lines: 45
+Deleted lines: 12
+Total hunks: 6
+
+Analysis completed successfully.
+```
+
+The default command (`python main.py`) continues to run the Step 1 environment diagnostic unchanged.
+
+---
+
+### H. Testing
+
+**93 tests pass in total** (15 Step 1 + 78 Step 2).
+
+| Test File | Coverage |
+| :--- | :--- |
+| `test_git_repository.py` | Valid repos, non-repos, branch/commit/detached detection, missing paths |
+| `test_git_status.py` | All change types, renames, conflicts, spaces in filenames, filter helpers |
+| `test_git_diff.py` | Staged/unstaged/combined diffs, binary files, truncation, untracked content |
+| `test_git_parser.py` | Hunk headers, multi-hunk/multi-file diffs, add/delete/rename/binary, malformed input |
+
+All tests use **isolated temporary Git repositories** via the `temp_git_repo` / `repo_with_initial_commit` pytest fixtures. No tests touch or modify the development repository.
+
+---
+
+### I. Step 2 Safety Guarantees
+
+The following Git commands are **never called** anywhere in `git_engine/`:
+
+| Prohibited | Reason |
+| :--- | :--- |
+| `git add` | Would modify the index |
+| `git commit` | Would create commits |
+| `git reset` | Would modify HEAD or index |
+| `git checkout` | Would modify working tree or HEAD |
+| `git clean` | Would delete untracked files |
+| `git push` | Would modify remotes |
+
+Working-tree files are opened **read-only**; no writes are performed.
+
+---
+
+### J. What Step 2 Does NOT Do
+
+These belong to later steps and are **not implemented**:
+
+- AI-based change grouping or semantic analysis (Step 3)
+- Commit message generation (Step 3)
+- Interactive approval workflow (Step 4)
+- Staging or executing commits (Step 5)
+- Pull Request generation (Step 6)
+
+The `RepositoryChanges` object produced by Step 2 is the structured input that Step 3 will consume.
