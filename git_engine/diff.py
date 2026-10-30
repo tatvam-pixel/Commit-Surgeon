@@ -1,5 +1,7 @@
 """Git diff extraction for staged, unstaged, and untracked changes."""
 
+import os
+import subprocess
 from pathlib import Path
 from typing import List, Optional, Tuple
 from pydantic import BaseModel, Field
@@ -25,8 +27,102 @@ class ExtractedDiffs(BaseModel):
     }
 
 
+def _run_git_diff_bounded(
+    cmd: List[str],
+    cwd: str,
+    max_chars: int,
+    encoding: str = "utf-8",
+) -> Tuple[str, bool]:
+    """Execute a git diff command while strictly bounding memory consumption.
+
+    Reads output incrementally in chunks from subprocess.stdout up to max_chars.
+    If the output exceeds max_chars, terminates the subprocess immediately to
+    prevent unbounded memory growth and unnecessary CPU cycles.
+
+    Returns:
+        Tuple of (diff_output_text, is_truncated)
+    """
+    if max_chars <= 0:
+        return "", True
+
+    full_cmd = ["git"] + cmd
+    try:
+        proc = subprocess.Popen(
+            full_cmd,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=8192,
+        )
+    except FileNotFoundError:
+        from git_engine.exceptions import GitExecutableNotFoundError
+        raise GitExecutableNotFoundError()
+    except Exception as exc:
+        raise DiffExtractionError(f"Failed to start git command {' '.join(cmd)}: {exc}")
+
+    output_chunks: List[str] = []
+    total_chars = 0
+    is_truncated = False
+    chunk_size = 8192
+
+    try:
+        while True:
+            remaining = max_chars - total_chars
+            if remaining <= 0:
+                is_truncated = True
+                break
+            # Read at most chunk_size bytes or remaining budget
+            read_size = min(chunk_size, max(remaining * 4, chunk_size))
+            raw_chunk = proc.stdout.read(read_size)
+            if not raw_chunk:
+                break
+            decoded = raw_chunk.decode(encoding, errors="replace")
+            if total_chars + len(decoded) > max_chars:
+                allowed = max_chars - total_chars
+                output_chunks.append(decoded[:allowed])
+                total_chars += allowed
+                is_truncated = True
+                break
+            output_chunks.append(decoded)
+            total_chars += len(decoded)
+    finally:
+        if is_truncated:
+            # Terminate subprocess early to prevent further memory and CPU consumption
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            except OSError:
+                pass
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
+        else:
+            _, stderr_data = proc.communicate()
+            if proc.returncode != 0:
+                err_text = stderr_data.decode(encoding, errors="replace")
+                raise DiffExtractionError(
+                    f"git {' '.join(cmd)} exited with code {proc.returncode}: {err_text}"
+                )
+
+    return "".join(output_chunks), is_truncated
+
+
 def is_binary_file(file_path: Path) -> bool:
-    """Check if a file appears to be binary by looking for null bytes in initial chunk."""
+    """Check if a file appears to be binary by looking for null bytes in initial chunk.
+
+    Never follows symbolic links.
+    """
+    try:
+        if file_path.is_symlink() or os.path.islink(file_path):
+            return False
+    except OSError:
+        return False
+
     if not file_path.is_file():
         return False
     try:
@@ -37,48 +133,45 @@ def is_binary_file(file_path: Path) -> bool:
         return False
 
 
-def get_unstaged_diff(path: Optional[str] = None) -> str:
+def get_unstaged_diff(path: Optional[str] = None, max_size: Optional[int] = None) -> str:
     """Extract unstaged diff in the working tree."""
     root = get_repository_root(path)
-    proc = _run_git_command(
+    limit = max_size if max_size is not None else get_settings().max_diff_size
+    diff_text, _ = _run_git_diff_bounded(
         ["diff", "--no-ext-diff", "--no-color", "--no-renames"],
         cwd=root,
-        check=False,
+        max_chars=limit,
     )
-    if proc.returncode != 0:
-        raise DiffExtractionError(f"git diff exited with code {proc.returncode}: {proc.stderr}")
-    return proc.stdout
+    return diff_text
 
 
-def get_staged_diff(path: Optional[str] = None) -> str:
+def get_staged_diff(path: Optional[str] = None, max_size: Optional[int] = None) -> str:
     """Extract staged diff in the Git index."""
     root = get_repository_root(path)
-    proc = _run_git_command(
+    limit = max_size if max_size is not None else get_settings().max_diff_size
+    diff_text, _ = _run_git_diff_bounded(
         ["diff", "--cached", "--no-ext-diff", "--no-color", "--no-renames"],
         cwd=root,
-        check=False,
+        max_chars=limit,
     )
-    if proc.returncode != 0:
-        raise DiffExtractionError(f"git diff --cached exited with code {proc.returncode}: {proc.stderr}")
-    return proc.stdout
+    return diff_text
 
 
-def get_combined_tracked_diff(path: Optional[str] = None) -> str:
+def get_combined_tracked_diff(path: Optional[str] = None, max_size: Optional[int] = None) -> str:
     """Extract combined tracked diff relative to HEAD (or fallback to staged if no HEAD)."""
     root = get_repository_root(path)
+    limit = max_size if max_size is not None else get_settings().max_diff_size
     head_commit = get_current_commit(root)
     if not head_commit:
         # Initial repository without commits: diff relative to empty tree (cached diff)
-        return get_staged_diff(root)
+        return get_staged_diff(root, max_size=limit)
 
-    proc = _run_git_command(
+    diff_text, _ = _run_git_diff_bounded(
         ["diff", "HEAD", "--no-ext-diff", "--no-color", "--no-renames"],
         cwd=root,
-        check=False,
+        max_chars=limit,
     )
-    if proc.returncode != 0:
-        raise DiffExtractionError(f"git diff HEAD exited with code {proc.returncode}: {proc.stderr}")
-    return proc.stdout
+    return diff_text
 
 
 def generate_untracked_diff(
@@ -89,6 +182,9 @@ def generate_untracked_diff(
 ) -> Tuple[str, bool]:
     """Generate synthetic unified diffs for untracked files without modifying index or working tree.
 
+    Never reads target file contents of untracked symlinks.
+    Enforces memory-bounded reading on large untracked files.
+
     Returns:
         Tuple of (diff_content, is_truncated).
     """
@@ -98,6 +194,31 @@ def generate_untracked_diff(
 
     for rel_path in untracked_relative_paths:
         full_path = root_path / rel_path
+
+        # Security: detect every symlink (internal, external, directory, or broken)
+        # Never call is_file(), is_binary_file(), or open() on a symlink.
+        if full_path.is_symlink() or os.path.islink(full_path):
+            try:
+                target = os.readlink(full_path)
+            except OSError:
+                continue
+            norm_rel = rel_path.replace("\\", "/")
+            target_str = str(target).replace("\\", "/")
+            block = (
+                f"diff --git a/{norm_rel} b/{norm_rel}\n"
+                f"new file mode 120000\n"
+                f"--- /dev/null\n"
+                f"+++ b/{norm_rel}\n"
+                f"@@ -0,0 +1 @@\n"
+                f"+symbolic link -> {target_str}\n"
+            )
+            if accumulated_size + len(block) > max_size:
+                truncated = True
+                break
+            diff_blocks.append(block)
+            accumulated_size += len(block)
+            continue
+
         if not full_path.is_file():
             continue
 
@@ -116,12 +237,23 @@ def generate_untracked_diff(
             accumulated_size += len(block)
             continue
 
+        # Memory-bounded file reading: do not read more than remaining budget
+        remaining_budget = max_size - accumulated_size
+        if remaining_budget <= 0:
+            truncated = True
+            break
+
         try:
             with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
+                content = f.read(remaining_budget + 1)
         except (OSError, PermissionError):
             continue
 
+        if len(content) > remaining_budget:
+            truncated = True
+            break
+
+        lines = content.splitlines(keepends=True)
         num_lines = len(lines)
         if num_lines == 0:
             header = (
@@ -148,7 +280,6 @@ def generate_untracked_diff(
         block = header + "".join(content_lines)
 
         if accumulated_size + len(block) > max_size:
-            # Check if we can include a partial truncated block or if we stop
             truncated = True
             break
 
@@ -162,31 +293,88 @@ def extract_all_diffs(
     path: Optional[str] = None,
     settings: Optional[Settings] = None,
 ) -> ExtractedDiffs:
-    """Extract staged, unstaged, and untracked diffs with size enforcement."""
+    """Extract staged, unstaged, and untracked diffs with memory-bounded streaming."""
     cfg = settings or get_settings()
     max_size = cfg.max_diff_size
     root = Path(get_repository_root(path))
-
-    unstaged = get_unstaged_diff(str(root))
-    staged = get_staged_diff(str(root))
-    combined = get_combined_tracked_diff(str(root))
-
-    # Retrieve untracked files safely from git status (which respects .gitignore)
-    proc_status = _run_git_command(
-        ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-        cwd=str(root),
-        check=True,
-    )
-    status_changes = parse_porcelain_status(proc_status.stdout)
-    untracked_paths = [c.file_path for c in status_changes if c.is_untracked]
-
-    total_tracked_len = len(unstaged) + len(staged)
     is_truncated = False
 
-    if total_tracked_len >= max_size:
+    # 1. Extract unstaged diff with bounded streaming
+    unstaged, unstaged_trunc = _run_git_diff_bounded(
+        ["diff", "--no-ext-diff", "--no-color", "--no-renames"],
+        cwd=str(root),
+        max_chars=max_size,
+    )
+    if unstaged_trunc:
+        return ExtractedDiffs(
+            unstaged_diff=unstaged,
+            staged_diff="",
+            combined_diff="",
+            untracked_diff="",
+            is_truncated=True,
+        )
+
+    # 2. Extract staged diff with bounded streaming
+    remaining_budget = max_size - len(unstaged)
+    if remaining_budget <= 0:
+        return ExtractedDiffs(
+            unstaged_diff=unstaged,
+            staged_diff="",
+            combined_diff="",
+            untracked_diff="",
+            is_truncated=True,
+        )
+
+    staged, staged_trunc = _run_git_diff_bounded(
+        ["diff", "--cached", "--no-ext-diff", "--no-color", "--no-renames"],
+        cwd=str(root),
+        max_chars=remaining_budget,
+    )
+    if staged_trunc:
+        return ExtractedDiffs(
+            unstaged_diff=unstaged,
+            staged_diff=staged,
+            combined_diff="",
+            untracked_diff="",
+            is_truncated=True,
+        )
+
+    # 3. Avoid retrieving a second full combined diff unnecessarily
+    if not unstaged and not staged:
+        combined = ""
+    elif staged and not unstaged:
+        combined = staged
+    elif unstaged and not staged:
+        combined = unstaged
+    else:
+        # Both staged and unstaged changes exist: bounded read of diff HEAD
+        head_commit = get_current_commit(root)
+        if head_commit:
+            combined, _ = _run_git_diff_bounded(
+                ["diff", "HEAD", "--no-ext-diff", "--no-color", "--no-renames"],
+                cwd=str(root),
+                max_chars=max_size,
+            )
+        else:
+            combined = staged
+
+    # 4. Extract untracked files with remaining budget
+    total_tracked_len = len(unstaged) + len(staged)
+    untracked_budget = max_size - total_tracked_len
+
+    if untracked_budget <= 0:
         is_truncated = True
         untracked = ""
     else:
+        # Retrieve untracked files safely from git status
+        proc_status = _run_git_command(
+            ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            cwd=str(root),
+            check=True,
+        )
+        status_changes = parse_porcelain_status(proc_status.stdout)
+        untracked_paths = [c.file_path for c in status_changes if c.is_untracked]
+
         untracked, un_truncated = generate_untracked_diff(
             untracked_relative_paths=untracked_paths,
             root_path=root,

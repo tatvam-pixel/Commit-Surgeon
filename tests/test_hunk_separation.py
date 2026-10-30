@@ -1,5 +1,6 @@
 """Regression tests for staged vs unstaged hunk separation and statistics."""
 
+import re
 import subprocess
 from pathlib import Path
 import pytest
@@ -8,6 +9,11 @@ from git_engine.analyzer import analyze_repository
 from git_engine.models import DiffHunk, FileChange, RepositoryChanges, RepositoryInfo
 from git_engine.parser import parse_unified_diff
 from main import run_analyze
+
+
+def _strip_ansi(text: str) -> str:
+    """Strip ANSI color codes so assertions work regardless of terminal styling."""
+    return re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", text)
 
 
 class TestDiffHunkSourceState:
@@ -179,14 +185,39 @@ class TestAnalyzerStagedUnstagedSeparation:
 
 
 class TestAuditRepositoryOutput:
-    """Test specific expected statistics on commit-surgeon-audit if available."""
+    """Test specific expected statistics on audit repository state (staged: +2/-2, unstaged: +3/-0)."""
 
-    def test_audit_repo_statistics(self):
-        audit_path = Path("commit-surgeon-audit")
-        if not audit_path.is_dir():
-            pytest.skip("commit-surgeon-audit directory not present")
+    @pytest.fixture
+    def audit_repo(self, repo_with_initial_commit: Path) -> Path:
+        """Create a reproducible repository matching the exact audit state."""
+        auth_file = repo_with_initial_commit / "auth.py"
+        auth_file.write_text(
+            "def login():\n    return False\n\ndef logout():\n    return False\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "auth.py"], cwd=str(repo_with_initial_commit), check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "initial auth"],
+            cwd=str(repo_with_initial_commit),
+            check=True,
+        )
 
-        changes = analyze_repository(str(audit_path))
+        # Stage change (+2, -2)
+        auth_file.write_text(
+            "def login():\n    return True\n\ndef logout():\n    return True\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "auth.py"], cwd=str(repo_with_initial_commit), check=True)
+
+        # Unstaged change (+3, -0)
+        auth_file.write_text(
+            "def login():\n    return True\n\ndef logout():\n    return True\n\ndef validate_user():\n    return True\n",
+            encoding="utf-8",
+        )
+        return repo_with_initial_commit
+
+    def test_audit_repo_statistics(self, audit_repo: Path):
+        changes = analyze_repository(str(audit_repo))
         assert changes.staged_added_lines == 2
         assert changes.staged_deleted_lines == 2
         assert changes.unstaged_added_lines == 3
@@ -195,28 +226,11 @@ class TestAuditRepositoryOutput:
         assert changes.total_deleted_lines == 2
         assert changes.total_hunks == 2
 
-    def test_audit_repo_cli_output(self, capsys):
-        audit_path = Path("commit-surgeon-audit")
-        if not audit_path.is_dir():
-            pytest.skip("commit-surgeon-audit directory not present")
-
-        exit_code = run_analyze(str(audit_path))
+    def test_audit_repo_cli_output(self, audit_repo: Path, capsys):
+        exit_code = run_analyze(str(audit_repo))
         assert exit_code == 0
-        captured = capsys.readouterr().out
+        captured = _strip_ansi(capsys.readouterr().out)
 
-        expected_block = (
-            "Diff Statistics:\n\n"
-            "Staged:\n"
-            "- Added lines: 2\n"
-            "- Deleted lines: 2\n\n"
-            "Unstaged:\n"
-            "- Added lines: 3\n"
-            "- Deleted lines: 0\n\n"
-            "Total:\n"
-            "- Added lines: 5\n"
-            "- Deleted lines: 2\n"
-            "- Hunks: 2"
-        )
         assert "Staged:\n- Added lines: 2\n- Deleted lines: 2" in captured
         assert "Unstaged:\n- Added lines: 3\n- Deleted lines: 0" in captured
         assert "Total:\n- Added lines: 5\n- Deleted lines: 2\n- Hunks: 2" in captured

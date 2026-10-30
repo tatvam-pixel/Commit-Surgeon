@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 import requests
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from config.settings import Settings, get_settings
 
@@ -30,6 +30,7 @@ class EnvironmentReport(BaseModel):
     ollama: ComponentStatus
     model: ComponentStatus
     all_ready: bool = False
+    endpoint_warning: Optional[str] = Field(default=None, description="Warning if Ollama endpoint is non-loopback")
 
 
 def check_python() -> ComponentStatus:
@@ -206,6 +207,22 @@ def check_local_model(
     )
 
 
+def is_loopback_url(url: str) -> bool:
+    """Check if a URL points to a loopback/localhost address.
+    
+    Returns True for localhost, 127.0.0.1, ::1, and [::1].
+    Returns False for all other addresses.
+    """
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname or ""
+        hostname = hostname.lower().strip("[]")
+        return hostname in ("localhost", "127.0.0.1", "::1")
+    except Exception:
+        return False
+
+
 def run_environment_check(
     settings: Optional[Settings] = None,
     repo_dir: Optional[str] = None,
@@ -222,6 +239,15 @@ def run_environment_check(
         ollama_running=ollama_status.is_ok,
     )
 
+    # Warn if Ollama endpoint is non-loopback (security concern for offline-first tool)
+    endpoint_warning = None
+    if not is_loopback_url(cfg.ollama_api_url):
+        endpoint_warning = (
+            f"WARNING: OLLAMA_API_URL is set to a non-loopback address ({cfg.ollama_api_url}). "
+            f"Code and diffs may be transmitted over the network. "
+            f"For offline-first security, use http://localhost:11434 or http://127.0.0.1:11434."
+        )
+
     all_ready = (
         python_status.is_ok
         and git_status.is_ok
@@ -235,4 +261,5 @@ def run_environment_check(
         ollama=ollama_status,
         model=model_status,
         all_ready=all_ready,
+        endpoint_warning=endpoint_warning,
     )

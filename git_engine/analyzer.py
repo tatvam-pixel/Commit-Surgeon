@@ -30,10 +30,19 @@ def analyze_repository(
     # Step 2: Extract staged, unstaged, and untracked diffs
     diffs = extract_all_diffs(root, settings=cfg)
 
-    # Step 3: Parse unified diffs into hunks with source attribution
-    staged_parsed = parse_unified_diff(diffs.staged_diff, source_state="staged")
-    unstaged_parsed = parse_unified_diff(diffs.unstaged_diff, source_state="unstaged")
-    untracked_parsed = parse_unified_diff(diffs.untracked_diff, source_state="untracked")
+    # Step 3: Parse unified diffs into hunks with authoritative path matching
+    known_paths = [c.file_path for c in status_changes] + [
+        c.old_path for c in status_changes if c.old_path
+    ]
+    staged_parsed = parse_unified_diff(
+        diffs.staged_diff, source_state="staged", known_paths=known_paths
+    )
+    unstaged_parsed = parse_unified_diff(
+        diffs.unstaged_diff, source_state="unstaged", known_paths=known_paths
+    )
+    untracked_parsed = parse_unified_diff(
+        diffs.untracked_diff, source_state="untracked", known_paths=known_paths
+    )
 
     # Index parsed changes by normalized file path
     parsed_by_path: Dict[str, List[FileChange]] = {}

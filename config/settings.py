@@ -35,6 +35,14 @@ class Settings(BaseModel):
         default_factory=lambda: int(os.getenv("MAX_DIFF_SIZE", "100000")),
         description="Maximum character count for a git diff before warning or chunking",
     )
+    max_context_size: int = Field(
+        default_factory=lambda: int(os.getenv("MAX_CONTEXT_SIZE", "50000")),
+        description="Maximum character count for LLM context before warning or error",
+    )
+    ai_temperature: float = Field(
+        default_factory=lambda: float(os.getenv("AI_TEMPERATURE", "0.1")),
+        description="Sampling temperature for local model inference (0.1 - 0.2)",
+    )
     debug: bool = Field(
         default_factory=lambda: os.getenv("DEBUG", "false").strip().lower()
         in ("true", "1", "yes"),

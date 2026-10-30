@@ -1,5 +1,6 @@
 """Unified Git diff parser for hunk extraction and structured representation."""
 
+import hashlib
 import re
 from typing import Dict, List, Optional, Tuple
 
@@ -42,32 +43,156 @@ def parse_hunk_header(header_line: str) -> Tuple[int, int, int, int]:
     return old_start, old_count, new_start, new_count
 
 
-def _extract_file_paths_from_diff_git(line: str) -> Tuple[str, str]:
-    """Extract old and new paths from a 'diff --git a/... b/...' line."""
-    # Standard format: diff --git a/<old> b/<new>
+def _git_unquote(s: str) -> str:
+    """Unescape Git C-style quoted path."""
+    result = []
+    i = 0
+    while i < len(s):
+        if s[i] == "\\" and i + 1 < len(s):
+            c = s[i + 1]
+            if c == "n":
+                result.append("\n")
+            elif c == "t":
+                result.append("\t")
+            elif c == "\\":
+                result.append("\\")
+            elif c == '"':
+                result.append('"')
+            elif c.isdigit():
+                # Octal escape: \OOO represents raw byte
+                octal = c
+                for k in range(2):
+                    if i + 2 + k < len(s) and s[i + 2 + k].isdigit():
+                        octal += s[i + 2 + k]
+                    else:
+                        break
+                byte_val = int(octal, 8)
+                result.append(chr(byte_val))
+                i += 1 + len(octal)
+                continue
+            else:
+                result.append(c)
+            i += 2
+        else:
+            result.append(s[i])
+            i += 1
+    raw_str = "".join(result)
+    # If the unquoted string contains multi-byte UTF-8 encoded as raw latin1 chars, decode it
+    try:
+        raw_bytes = raw_str.encode("latin-1")
+        return raw_bytes.decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return raw_str
+
+
+def _clean_git_header_path(raw: str, prefix: Optional[str] = None) -> str:
+    """Clean, unescape, and strip prefixes from a path in a Git diff header."""
+    p = raw.strip()
+    if p.startswith('"') and p.endswith('"'):
+        p = _git_unquote(p[1:-1])
+    elif '"' in p:
+        p = _git_unquote(p)
+
+    if prefix and p.startswith(prefix):
+        p = p[len(prefix):]
+    elif p.startswith("a/") or p.startswith("b/"):
+        p = p[2:]
+
+    # Also handle if prefix was inside quotes (e.g. "a/foo" -> unquoted a/foo -> foo)
+    if prefix and p.startswith(prefix):
+        p = p[len(prefix):]
+    elif p.startswith("a/") or p.startswith("b/"):
+        p = p[2:]
+
+    return p.replace("\\", "/")
+
+
+def _split_quoted_paths(rest: str) -> Optional[Tuple[str, str]]:
+    """Parse Git quoted path format: \"a/path\" \"b/path\" or mixed."""
+    try:
+        parts = []
+        i = 0
+        while i < len(rest):
+            if rest[i] == '"':
+                j = i + 1
+                while j < len(rest):
+                    if rest[j] == "\\" and j + 1 < len(rest):
+                        j += 2
+                        continue
+                    if rest[j] == '"':
+                        break
+                    j += 1
+                quoted = rest[i + 1 : j]
+                quoted = _clean_git_header_path(quoted)
+                parts.append(quoted)
+                i = j + 1
+            elif rest[i] == " ":
+                i += 1
+            else:
+                end = rest.find(" ", i)
+                if end == -1:
+                    parts.append(_clean_git_header_path(rest[i:]))
+                    break
+                parts.append(_clean_git_header_path(rest[i:end]))
+                i = end
+
+        if len(parts) >= 2:
+            return parts[0], parts[1]
+    except Exception:
+        pass
+    return None
+
+
+def _extract_file_paths_from_diff_git(
+    line: str,
+    known_paths: Optional[List[str]] = None,
+) -> Tuple[str, str]:
+    """Extract old and new paths from a 'diff --git a/... b/...' line without ambiguous splitting.
+
+    Handles edge cases:
+    - Authoritative matching against known repository paths when provided
+    - Exact O(1) mathematical midpoint resolution for non-rename changes
+    - Filenames containing ' b/' literally
+    - Git quoted paths with C-style escapes
+    - Unicode and unusual characters
+    """
     prefix = "diff --git "
     if not line.startswith(prefix):
         raise DiffParsingError(f"Expected 'diff --git', got: {line}")
 
     rest = line[len(prefix):]
-    # Find split point between a/ and b/
-    # If filename has spaces, ' b/' could appear in the middle, so we find ' b/' matching
-    # Best heuristic: if line contains ' b/', check candidate splits
-    if " a/" in rest or rest.startswith("a/"):
-        # standard case
-        if rest.startswith("a/"):
-            rest_no_a = rest[2:]
-            # We look for ' b/'
-            parts = rest_no_a.split(" b/")
-            if len(parts) == 2:
-                return parts[0], parts[1]
-            elif len(parts) > 2:
-                # Handle filename containing ' b/' by joining halves
-                # Or fallback to splitting at half
-                mid = len(parts) // 2
-                return " b/".join(parts[:mid]), " b/".join(parts[mid:])
 
-    # Fallback: simple split
+    # 1. Authoritative lookup: match directly against known repository paths if provided
+    if known_paths:
+        norm_paths = sorted([kp.replace("\\", "/") for kp in known_paths], key=len, reverse=True)
+        for kp in norm_paths:
+            if rest == f"a/{kp} b/{kp}" or rest == f'"{kp}" "{kp}"' or rest == f'"a/{kp}" "b/{kp}"':
+                return kp, kp
+
+    # 2. Handle Git quoted paths: "a/path" "b/path"
+    if rest.startswith('"'):
+        parts = _split_quoted_paths(rest)
+        if parts:
+            return parts
+
+    # 3. Exact deterministic resolution for standard identical paths: a/<X> b/<X>
+    # When old_path == new_path, the line format is "a/" + X + " b/" + X.
+    # Total length is 2*len(X) + 5. The path length is deterministically (len(rest) - 5) // 2.
+    if rest.startswith("a/") and len(rest) >= 5 and (len(rest) - 5) % 2 == 0:
+        path_len = (len(rest) - 5) // 2
+        candidate_old = rest[2 : 2 + path_len]
+        separator = rest[2 + path_len : 2 + path_len + 3]
+        candidate_new = rest[2 + path_len + 3 :]
+        if separator == " b/" and candidate_old == candidate_new:
+            return candidate_old, candidate_new
+
+    # 4. Fallback for rename diff --git lines (supplemented by rename from/to headers in caller)
+    if " b/" in rest:
+        parts = rest.split(" b/", 1)
+        old = parts[0][2:] if parts[0].startswith("a/") else parts[0]
+        new = parts[1]
+        return old, new
+
     parts = rest.split()
     if len(parts) >= 2:
         old = parts[0][2:] if parts[0].startswith("a/") else parts[0]
@@ -80,8 +205,13 @@ def _extract_file_paths_from_diff_git(line: str) -> Tuple[str, str]:
 def parse_unified_diff(
     diff_text: str,
     source_state: str = "unstaged",
+    known_paths: Optional[List[str]] = None,
 ) -> List[FileChange]:
-    """Parse complete unified diff text into a list of FileChange models with DiffHunk objects."""
+    """Parse complete unified diff text into a list of FileChange models with DiffHunk objects.
+
+    Uses authoritative header lines (--- a/..., +++ b/..., rename to ..., copy to ...)
+    and optional known repository path metadata to eliminate ambiguous path heuristics.
+    """
     if not diff_text or not diff_text.strip():
         return []
 
@@ -117,15 +247,7 @@ def parse_unified_diff(
         change_type = "modified"
         is_binary = False
 
-        if first_line.startswith("diff --git "):
-            old_p, new_p = _extract_file_paths_from_diff_git(first_line)
-            old_path = old_p
-            new_path = new_p
-            file_path = new_p
-        else:
-            file_path = "unknown"
-
-        # Scan file header lines before hunks
+        # Scan file header lines before hunks to extract authoritative paths
         hunk_start_idx = -1
         for idx, line in enumerate(block):
             s_line = line.strip()
@@ -136,17 +258,17 @@ def parse_unified_diff(
             elif s_line.startswith("similarity index "):
                 change_type = "renamed"
             elif s_line.startswith("rename from "):
-                old_path = s_line[len("rename from "):].strip()
+                old_path = _clean_git_header_path(s_line[len("rename from "):])
                 change_type = "renamed"
             elif s_line.startswith("rename to "):
-                new_path = s_line[len("rename to "):].strip()
+                new_path = _clean_git_header_path(s_line[len("rename to "):])
                 file_path = new_path
                 change_type = "renamed"
             elif s_line.startswith("copy from "):
-                old_path = s_line[len("copy from "):].strip()
+                old_path = _clean_git_header_path(s_line[len("copy from "):])
                 change_type = "copied"
             elif s_line.startswith("copy to "):
-                new_path = s_line[len("copy to "):].strip()
+                new_path = _clean_git_header_path(s_line[len("copy to "):])
                 file_path = new_path
                 change_type = "copied"
             elif s_line.startswith("Binary files ") and " differ" in s_line:
@@ -157,18 +279,32 @@ def parse_unified_diff(
                 path_part = s_line[4:].strip()
                 if path_part == "/dev/null":
                     change_type = "added"
-                elif path_part.startswith("a/"):
-                    old_path = path_part[2:]
+                else:
+                    old_path = _clean_git_header_path(path_part, prefix="a/")
             elif s_line.startswith("+++ "):
                 path_part = s_line[4:].strip()
                 if path_part == "/dev/null":
                     change_type = "deleted"
-                elif path_part.startswith("b/"):
-                    new_path = path_part[2:]
+                else:
+                    new_path = _clean_git_header_path(path_part, prefix="b/")
                     file_path = new_path
             elif s_line.startswith("@@ "):
                 hunk_start_idx = idx
                 break
+
+        # Fallback to diff --git line if paths were not resolved from ---/+++/rename headers
+        if not file_path or not old_path or not new_path:
+            if first_line.startswith("diff --git "):
+                old_p, new_p = _extract_file_paths_from_diff_git(first_line, known_paths=known_paths)
+                if not old_path:
+                    old_path = old_p
+                if not new_path:
+                    new_path = new_p
+                if not file_path:
+                    file_path = new_p or old_p
+            else:
+                if not file_path:
+                    file_path = "unknown"
 
         hunks: List[DiffHunk] = []
         file_added = 0
@@ -196,7 +332,6 @@ def parse_unified_diff(
                 try:
                     old_s, old_c, new_s, new_c = parse_hunk_header(header)
                 except DiffParsingError:
-                    # If malformed header, record default values
                     old_s, old_c, new_s, new_c = 0, 0, 0, 0
 
                 hunk_added = 0
@@ -211,7 +346,8 @@ def parse_unified_diff(
                 file_deleted += hunk_deleted
                 hunk_counter += 1
 
-                hunk_id = f"hunk_{hunk_counter}_{source_state}_{file_path.replace('/', '_')}"
+                path_hash = hashlib.sha256(file_path.encode("utf-8")).hexdigest()[:12]
+                hunk_id = f"hunk_{hunk_counter}_{source_state}_{path_hash}"
                 hunks.append(
                     DiffHunk(
                         hunk_id=hunk_id,

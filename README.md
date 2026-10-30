@@ -23,14 +23,15 @@ Manually staging changes with `git add -p` is time-consuming, tedious, and error
 
 | Feature / Component | Status | Description |
 | :--- | :---: | :--- |
-| **Project Foundation & Structure** | **Implemented** | Modular package hierarchy with PEP 8 standards |
-| **Configuration Management** | **Implemented** | Pydantic-based settings with `.env` support |
-| **Environment Verification** | **Implemented** | Auto-detection for Python, Git, Ollama, and local models |
-| **Initial Rich CLI** | **Implemented** | Read-only diagnostic CLI displaying system readiness |
-| **Comprehensive Test Suite** | **Implemented** | Pytest unit test coverage with external service mocking |
-| *Diff Parsing & Hunk Extraction* | *Planned (Step 2)* | Extraction of working tree diffs and hunk boundaries |
-| *Semantic Hunk Clustering* | *Planned (Step 3)* | Local LLM grouping of related changes into commit plans |
-| *Commit Message Generation* | *Planned (Step 3)* | Conventional Commits generated via `qwen3.5:4b` |
+| **Project Foundation & Structure** | **Implemented (Step 1)** | Modular package hierarchy with PEP 8 standards |
+| **Configuration Management** | **Implemented (Step 1)** | Pydantic-based settings with `.env` support |
+| **Environment Verification** | **Implemented (Step 1)** | Auto-detection for Python, Git, Ollama, and local models |
+| **Initial Rich CLI** | **Implemented (Step 1)** | Read-only diagnostic CLI displaying system readiness |
+| **Diff Parsing & Hunk Extraction** | **Implemented (Step 2)** | Staged, unstaged, and untracked diff extraction with hunk attribution |
+| **Repository Changes Analyzer** | **Implemented (Step 2)** | CLI `analyze` command and structured change statistics |
+| **Semantic Hunk Clustering** | **Implemented (Step 3)** | Local LLM grouping of related changes into commit plans |
+| **Commit Message Generation** | **Implemented (Step 3)** | Conventional Commits generated via `qwen3.5:4b` with validation |
+| **AI Change Grouping CLI** | **Implemented (Step 3)** | CLI `group` command with self-repairing JSON parser and validator |
 | *Interactive Human Approval* | *Planned (Step 4)* | Terminal review, edit, and confirmation interface |
 | *Atomic Commit Execution* | *Planned (Step 5)* | Safe Git staging and commit creation without data loss |
 | *Pull Request Generation* | *Planned (Step 6)* | Consolidated PR summary and markdown documentation |
@@ -55,37 +56,64 @@ Manually staging changes with `git add -p` is time-consuming, tedious, and error
 ```text
 commit-surgeon/
 │
-├── main.py                 # Application entry point and diagnostic CLI
-├── requirements.txt        # Pinned project dependencies
+├── main.py                 # Application entry point and CLI commands (check, analyze, group)
+├── requirements.txt        # Minimum version dependency specifications
 ├── .gitignore              # Git ignore rules for Python, virtualenv, and temp files
 ├── README.md               # Documentation and setup guide
+├── WALKTHROUGH.md          # Technical walkthrough and architectural guide
 ├── .env.example            # Sample configuration settings
 │
 ├── config/                 # Application configuration
 │   ├── __init__.py
 │   └── settings.py         # Pydantic Settings class loading from environment
 │
-├── git_engine/             # Git repository inspection and staging (future steps)
-│   └── __init__.py
+├── git_engine/             # Git repository inspection and diff extraction
+│   ├── __init__.py
+│   ├── analyzer.py         # RepositoryChanges aggregation and diff analyzer
+│   ├── diff.py             # Staged, unstaged, and synthetic untracked diff extraction
+│   ├── exceptions.py       # Git engine exception hierarchy
+│   ├── models.py           # DiffHunk, FileChange, RepositoryChanges models
+│   ├── parser.py           # Unified diff parser and hunk header extraction
+│   ├── repository.py       # Git command execution and repository metadata
+│   └── status.py           # Git status parsing and change classification
 │
-├── ai_engine/              # Ollama client and prompt templates (future steps)
-│   └── __init__.py
+├── ai_engine/              # Local LLM integration and semantic grouping
+│   ├── __init__.py
+│   ├── analyzer.py         # AIChangeAnalyzer with self-healing JSON repair
+│   ├── context.py          # PreparedChangeContext and sensitive file filtering
+│   ├── exceptions.py       # AI engine exception hierarchy
+│   ├── grouper.py          # ChangeGrouper high-level workflow coordinator
+│   ├── models.py           # Pydantic models for grouping results and proposed commits
+│   ├── ollama_client.py    # Local Ollama REST client
+│   ├── prompts.py          # Strict system and grouping prompts
+│   └── validator.py        # GroupValidator enforcing grouping invariants
 │
-├── approval/               # Interactive human approval flow (future steps)
+├── approval/               # Interactive human approval flow (Step 4)
 │   └── __init__.py
 │
 ├── utils/                  # Helper utilities and environment verification
 │   ├── __init__.py
-│   └── environment.py      # Python, Git, Ollama, and Model detection
-│
-├── output/                 # Directory for generated reports and PR artifacts
-│   └── .gitkeep
+│   └── environment.py      # Python, Git, Ollama, model, and endpoint checks
 │
 └── tests/                  # Automated Pytest suite
     ├── __init__.py
-    ├── test_cli.py         # CLI startup and output formatting tests
-    ├── test_config.py      # Configuration and default values tests
-    └── test_environment.py # Environment detection and mock service tests
+    ├── conftest.py         # Shared fixtures and temporary Git repositories
+    ├── test_ai_analyzer.py
+    ├── test_ai_models.py
+    ├── test_change_grouper.py
+    ├── test_cli.py
+    ├── test_config.py
+    ├── test_conflict_and_attribution.py
+    ├── test_environment.py
+    ├── test_git_diff.py
+    ├── test_git_parser.py
+    ├── test_git_repository.py
+    ├── test_git_status.py
+    ├── test_group_validator.py
+    ├── test_hunk_id_and_endpoint.py
+    ├── test_hunk_separation.py
+    ├── test_ollama_client.py
+    └── test_security_fixes.py
 ```
 
 ---
@@ -188,47 +216,33 @@ ollama pull qwen3.5:4b
 
 ## 7. Running the Application
 
+### 1. Environment Diagnostic Check
+
 Run the diagnostic CLI:
 
 ```bash
 python main.py
 ```
 
-### Expected Output:
+### 2. Git Change Analysis
 
-When services and models are fully configured:
-```text
-COMMIT SURGEON
-AI-powered offline Git commit management
+Analyze changes in the current repository or a specified path:
 
-Version: 0.1.0
-
-Environment Status:
-- Python: Installed
-- Git: Installed
-- Ollama: Running
-- Local Model: Available
-
-Project Status: Environment Check Complete (Ready)
+```bash
+python main.py analyze [optional_path]
 ```
 
-When Ollama is not running:
-```text
-COMMIT SURGEON
-AI-powered offline Git commit management
+This inspects the repository, partitions staged and unstaged hunks, and outputs a detailed statistical summary.
 
-Version: 0.1.0
+### 3. AI Change Grouping
 
-Environment Status:
-- Python: Installed
-- Git: Installed
-- Ollama: Not Running
-- Local Model: Unknown
+Analyze and group related changes into atomic proposed commits using the local `qwen3.5:4b` model:
 
-Project Status: Environment Check Complete (Setup Required)
+```bash
+python main.py group [optional_path]
 ```
 
-If Ollama is stopped or the model has not yet been pulled, the CLI will clearly report the status and provide exact copy-paste commands (`ollama serve`, `ollama pull qwen3.5:4b`) to resolve it.
+This prepares sanitized context (excluding sensitive files like `.env`), executes structured local inference, validates group cohesion and completeness, and displays proposed commit groups with titles and justifications.
 
 ---
 
